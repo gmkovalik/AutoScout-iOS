@@ -1,44 +1,46 @@
-name: iOS starter workflow
+
+name: Build AutoScout iOS project
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
   build:
-    name: Build and Test default scheme using any available iPhone simulator
+    name: Build AutoScout for iOS
     runs-on: macos-latest
 
     steps:
-      - name: Checkout
+      - name: Check out AutoScout
         uses: actions/checkout@v4
-      - name: Set Default Scheme
+
+      - name: Install system dependencies
         run: |
-          scheme_list=$(xcodebuild -list -json | tr -d "\n")
-          default=$(echo $scheme_list | ruby -e "require 'json'; puts JSON.parse(STDIN.gets)['project']['targets'][0]")
-          echo $default | cat >default
-          echo Using default scheme: $default
-      - name: Build
-        env:
-          scheme: ${{ 'default' }}
-          platform: ${{ 'iOS Simulator' }}
+          brew install autoconf automake libtool pkg-config
+          brew link libtool
+
+      - name: Set up Kivy iOS toolchain
         run: |
-          # xcrun xctrace returns via stderr, not the expected stdout (see https://developer.apple.com/forums/thread/663959)
-          device=`xcrun xctrace list devices 2>&1 | grep -oE 'iPhone.*?[^\(]+' | head -1 | awk '{$1=$1;print}' | sed -e "s/ Simulator$//"`
-          if [ $scheme = default ]; then scheme=$(cat default); fi
-          if [ "`ls -A | grep -i \\.xcworkspace\$`" ]; then filetype_parameter="workspace" && file_to_build="`ls -A | grep -i \\.xcworkspace\$`"; else filetype_parameter="project" && file_to_build="`ls -A | grep -i \\.xcodeproj\$`"; fi
-          file_to_build=`echo $file_to_build | awk '{$1=$1;print}'`
-          xcodebuild build-for-testing -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -destination "platform=$platform,name=$device"
-      - name: Test
-        env:
-          scheme: ${{ 'default' }}
-          platform: ${{ 'iOS Simulator' }}
+          python3 -m venv "$RUNNER_TEMP/kivy-ios-venv"
+          source "$RUNNER_TEMP/kivy-ios-venv/bin/activate"
+          python -m pip install --upgrade pip
+          python -m pip install Cython==3.0.11 kivy-ios
+
+      - name: Build iOS libraries and Kivy
         run: |
-          # xcrun xctrace returns via stderr, not the expected stdout (see https://developer.apple.com/forums/thread/663959)
-          device=`xcrun xctrace list devices 2>&1 | grep -oE 'iPhone.*?[^\(]+' | head -1 | awk '{$1=$1;print}' | sed -e "s/ Simulator$//"`
-          if [ $scheme = default ]; then scheme=$(cat default); fi
-          if [ "`ls -A | grep -i \\.xcworkspace\$`" ]; then filetype_parameter="workspace" && file_to_build="`ls -A | grep -i \\.xcworkspace\$`"; else filetype_parameter="project" && file_to_build="`ls -A | grep -i \\.xcodeproj\$`"; fi
-          file_to_build=`echo $file_to_build | awk '{$1=$1;print}'`
-          xcodebuild test-without-building -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -destination "platform=$platform,name=$device"
+          source "$RUNNER_TEMP/kivy-ios-venv/bin/activate"
+          toolchain build python3 kivy
+
+      - name: Create AutoScout Xcode project
+        run: |
+          source "$RUNNER_TEMP/kivy-ios-venv/bin/activate"
+          toolchain create AutoScout "$GITHUB_WORKSPACE"
+
+      - name: Upload Xcode project
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoScout-iOS-XcodeProject
+          path: AutoScout-ios/
+          if-no-files-found: error
+

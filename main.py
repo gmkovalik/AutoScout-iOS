@@ -1,6 +1,6 @@
 """AutoScout Mobile — phone-first Kivy interface using the AutoScout 4.1.0 engine."""
 from __future__ import annotations
-import json, os, threading, webbrowser
+import json, os, threading, webbrowser, uuid
 from functools import partial
 from kivy.app import App
 from kivy.clock import Clock
@@ -115,6 +115,9 @@ class AutoScoutMobile(App):
         self.scouts = []
         self.watch_teams = []
         self.assignments = {}
+        self.notes_storage = 'local'
+        self.google_sheets_url = ''
+        self._refreshing = False
         self._load_mobile_state()
         self.selected_team = int(self.session.my_team or 0)
         self.root_box = BoxLayout(orientation='vertical', spacing=0)
@@ -148,9 +151,17 @@ class AutoScoutMobile(App):
         self.root_box.add_widget(self.status)
         self.show_page('Home')
         return self.root_box
+    def on_start(self):
+        self._live_refresh_event = Clock.schedule_interval(self._scheduled_live_refresh, 60)
+    def on_stop(self):
+        event = getattr(self, '_live_refresh_event', None)
+        if event: event.cancel()
+    def _scheduled_live_refresh(self, _dt):
+        if self.session.loaded and not self._refreshing:
+            self.refresh_event(silent=True)
     def _header_paint(self,*_): self.header_bg.pos=self.header.pos; self.header_bg.size=self.header.size
     def open_menu(self,*_):
-        names=['Home','Competition Day','Setup','Teams','Matches','My Team','Standings','Alliances','Charts','Win Rate','Analysis','Live Scout','Team Search','Scouts','Settings']
+        names=['Home','Schedule Data','Setup','Teams','My Team','Standings','Alliances','Charts','Win Rate','Analysis','Live Scout','Team Search','Scouts','Settings']
         menu=DropDown(auto_width=False,width=dp(250),max_height=Window.height-dp(90))
         for name in names:
             b=Button(text=name,size_hint_y=None,height=dp(44),background_normal='',background_color=MAROON if name==self.page else (0.93,0.94,0.96,1),color=WHITE if name==self.page else INK,font_size=sp(14))
@@ -169,16 +180,26 @@ class AutoScoutMobile(App):
     def _load_mobile_state(self):
         p=os.path.join(self.user_data_dir,'mobile_state.json')
         try:
-            d=json.load(open(p,encoding='utf-8')); self.scouts=d.get('scouts',[]); self.watch_teams=d.get('watch_teams',[]); self.assignments=d.get('assignments',{})
+            d=json.load(open(p,encoding='utf-8')); self.scouts=d.get('scouts',[]); self.watch_teams=d.get('watch_teams',[]); self.assignments=d.get('assignments',{}); self.notes_storage=d.get('notes_storage','local'); self.google_sheets_url=d.get('google_sheets_url','')
             self.selected_team=int(d.get('selected_team',0) or 0)
             spath=d.get('session_path')
             if spath and os.path.exists(spath): self.session=core.Session.open(spath)
         except Exception: pass
     def save_state(self):
         p=os.path.join(self.user_data_dir,'mobile_state.json')
-        try: json.dump({'scouts':self.scouts,'watch_teams':self.watch_teams,'assignments':self.assignments,'selected_team':self.selected_team,'session_path':self.session.path},open(p,'w',encoding='utf-8'),indent=2)
+        try: json.dump({'scouts':self.scouts,'watch_teams':self.watch_teams,'assignments':self.assignments,'selected_team':self.selected_team,'session_path':self.session.path,'notes_storage':self.notes_storage,'google_sheets_url':self.google_sheets_url},open(p,'w',encoding='utf-8'),indent=2)
         except Exception as e: self.status.text=f'Save warning: {e}'
     def say(self,msg): self.status.text=str(msg)
+    def show_message_popup(self,title,message):
+        content=BoxLayout(orientation='vertical',spacing=dp(8),padding=dp(12))
+        header=BoxLayout(size_hint_y=None,height=dp(48),spacing=dp(8))
+        header.add_widget(Label(text=title,color=MAROON,bold=True,font_size=sp(16),halign='left'))
+        content.add_widget(header)
+        content.add_widget(Label(text=str(message),color=INK,halign='left',valign='middle'))
+        popup=Popup(title='',content=content,size_hint=(.9,.42),auto_dismiss=False)
+        close=Button(text='×',size_hint=(None,None),size=(dp(46),dp(46)),font_size=sp(25),background_normal='',background_color=MAROON,color=WHITE)
+        close.bind(on_release=lambda *_:popup.dismiss())
+        header.add_widget(close); popup.open(); return popup
     def add(self,w): self.body.add_widget(w)
     def label(self,text,size=14,color=INK,bold=False,height=None):
         l=Label(text=str(text),size_hint_y=None,height=dp(height or (30 if size<16 else 38)),font_size=sp(size),color=color,bold=bold,halign='left',valign='middle')
@@ -214,29 +235,12 @@ class AutoScoutMobile(App):
         if self.session.loaded:
             a,b=self.session.accuracy(); c.add_widget(self.label(f'Prediction accuracy: {a}/{b} scored matches',13))
         quick=self.card('QUICK ACTIONS')
-        for n in ['Setup','Matches','Teams','My Team','Live Scout','Team Search']:
+        for n in ['Setup','Schedule Data','Teams','My Team','Live Scout','Team Search']:
             quick.add_widget(self.button(n,partial(self.show_page,n),40))
         c=self.card('MOBILE WORKSPACE')
         c.add_widget(self.label('The mobile edition carries the AutoScout 4.1.0 calculation engine, session format, FTCScout data client, CAP / OPR / EPA predictions, standings, alliance analysis, and export/report functions.',13))
     def page_competition_day(self):
-        self.add(self.label('Competition day',21,MAROON,True,40))
-        c=self.card('LIVE EVENT STATUS')
-        c.add_widget(self.label(self.session.event_name if self.session.loaded else 'No event loaded',16,INK,True))
-        c.add_widget(self.label(f'{sum(1 for m in self.session.matches if m.played)} of {len(self.session.matches)} matches completed',13,MUTED))
-        c.add_widget(self.button('Refresh live match results',self.refresh_event))
-        c.add_widget(self.button('Open full match schedule',lambda:self.show_page('Matches')))
-        if self.session.matches:
-            upcoming=next((p for p in self.session.predictions if not p.match.played),None)
-            if upcoming:
-                m=upcoming.match
-                c.add_widget(self.label(f'Next unplayed: {m.label}  •  Red {m.red} vs Blue {m.blue}',14,MAROON,True))
-                c.add_widget(self.button('Open next match',lambda:self.match_detail(upcoming)))
-        w=self.card('WATCHLIST MATCHES')
-        count=0
-        for p in self.session.predictions:
-            if any(n in self.watch_teams for n in p.match.teams):
-                m=p.match; w.add_widget(self.label(f'{m.label}: Red {m.red} vs Blue {m.blue}',13)); count+=1
-        if not count:w.add_widget(self.label('Add teams in Scouts to highlight their matches.',12,MUTED))
+        self.page_schedule_data()
     def page_win_rate(self):
         self.add(self.label('Alliance win-rate model',21,MAROON,True,40))
         fit=self.session.strength_fit
@@ -297,18 +301,25 @@ class AutoScoutMobile(App):
                 self.say(msg + ' Warning: ' + ' | '.join(self.session.warnings[:2]))
         else:
             self.say('Event load failed: '+msg)
-            popup=Popup(title='Could not load event',content=Label(text=msg, color=INK),size_hint=(.9,.42))
-            popup.open()
-    def refresh_event(self):
+            self.show_message_popup('Could not load event',msg)
+    def refresh_event(self,*_,silent=False):
+        if self._refreshing or not self.session.event_code:return
+        self._refreshing=True
         def work():
-            try: n=self.session.refresh_results(self.client); msg=f'Refreshed results: {n} matches played.'
+            try:
+                self.session.load(self.client,progress=self.set_progress,with_history=True)
+                n=sum(1 for match in self.session.matches if match.played)
+                msg=f'Updated meet data: {n} matches played and team statistics recalculated.'
             except Exception as e: msg=f'Refresh failed: {e}'
-            Clock.schedule_once(lambda dt:self._refresh_done(msg),0)
-        threading.Thread(target=work,daemon=True).start(); self.set_progress('Refreshing match results…',0.1); self.say('Refreshing results…')
-    def _refresh_done(self,msg):
-        self.hide_progress(); self.save_state(); self.say(msg)
+            Clock.schedule_once(lambda dt:self._refresh_done(msg,silent),0)
+        threading.Thread(target=work,daemon=True).start()
+        if not silent:self.set_progress('Refreshing meet results and team statistics…',0.1); self.say('Refreshing all meet data…')
+    def _refresh_done(self,msg,silent=False):
+        self._refreshing=False; self.hide_progress(); self.save_state(); self.say(msg)
         if msg.startswith('Refresh failed:'):
-            Popup(title='Refresh failed',content=Label(text=msg,color=INK),size_hint=(.9,.4)).open()
+            if not silent:self.show_message_popup('Refresh failed',msg)
+        elif self.page in ('Schedule Data','Teams','Standings','My Team','Charts','Home'):
+            self.show_page(self.page)
     def apply_schedule(self):
         self.session.pasted_schedule=self.schedule_f.text; self.session.api_matches=[]; self.session.compute(); self.save_state(); self.say(f'Imported {len(self.session.matches)} matches.'); self.show_page('Matches')
     def save_session(self):
@@ -358,50 +369,76 @@ class AutoScoutMobile(App):
         if n not in self.watch_teams:self.watch_teams.append(n)
         self.save_state(); self.say(f'Team {n} added to watchlist.')
     def page_matches(self):
-        self.add(self.label('Match predictions',21,MAROON,True,40))
-        if not self.session.matches: self.add(self.label('Load an event or paste a schedule first.',14,MUTED)); return
-        legend=self.card('ALLIANCE KEY')
-        legend.add_widget(self.data_button('RED ALLIANCE  •  red = red win / red prediction',bg=RED_LIGHT,fg=RED,height=34,bold=True))
-        legend.add_widget(self.data_button('BLUE ALLIANCE  •  blue = blue win / blue prediction',bg=BLUE_LIGHT,fg=BLUE,height=34,bold=True))
-        f=self.field('Filter by match or team number'); self.add(f)
+        self.page_schedule_data()
+    def page_schedule_data(self):
+        self.add(self.label('Schedule Data',21,MAROON,True,40))
+        status=self.card('LIVE EVENT STATUS')
+        status.add_widget(self.label(self.session.event_name if self.session.loaded else 'No event loaded',16,INK,True))
+        played=sum(1 for m in self.session.matches if m.played)
+        status.add_widget(self.label(f'{played} of {len(self.session.matches)} matches completed',13,MUTED))
+        status.add_widget(self.button('Refresh all meet data now',self.refresh_event))
+        upcoming=next((p for p in self.session.predictions if not p.match.played),None)
+        if upcoming:
+            m=upcoming.match
+            status.add_widget(self.data_button(f'Next unplayed: {m.label}  |  Red {m.red} vs Blue {m.blue}',partial(self.match_detail,upcoming),PAGE,INK,42,True))
+        if not self.session.matches:
+            self.add(self.label('Load an event or paste a schedule first.',14,MUTED)); return
+        f=self.field('Filter by match, team number, or team name'); self.add(f)
         holder=BoxLayout(orientation='vertical',spacing=dp(9),size_hint_y=None)
         holder.bind(minimum_height=holder.setter('height')); self.add(holder)
         def render(*_):
             holder.clear_widgets(); q=f.text.lower().strip()
             for p in self.session.predictions:
                 mt=p.match; teams=mt.teams
-                if q and q not in mt.label.lower() and not any(q in str(n) for n in teams): continue
-                red='  /  '.join(map(str,mt.red)); blue='  /  '.join(map(str,mt.blue))
+                names=[self.session.team_names.get(n,'') for n in teams]
+                if q and q not in mt.label.lower() and not any(q in str(n) for n in teams) and not any(q in name.lower() for name in names): continue
+                red='  /  '.join(f'{n} {self.session.team_names.get(n,"")}'.strip() for n in mt.red)
+                blue='  /  '.join(f'{n} {self.session.team_names.get(n,"")}'.strip() for n in mt.blue)
                 watch='   ★ WATCHLIST' if any(n in self.watch_teams for n in teams) else ''
-                winner=mt.winner or p.winner
+                winner=mt.winner or (p.winner if not mt.played else None)
+                selected_side=mt.color_of(self.selected_team) if self.selected_team else None
+                if mt.played:
+                    won=(winner==selected_side) if selected_side else winner in ('RED','BLUE')
+                    result_mark='✓' if won else '✕'
+                    result_color=(0.12,0.58,0.32,1) if won else RED
+                    qual_text=f'{mt.label}  {result_mark}{watch}'
+                else:
+                    result_color=INK; qual_text=f'{mt.label}{watch}'
                 row=Card(padding=[dp(8),dp(8)],spacing=dp(4))
-                heading=f'{mt.label}{watch}' + (f'    FINAL  {mt.red_score:g}–{mt.blue_score:g}' if mt.played else f'    PREDICTED WIN: {winner}')
-                row.add_widget(self.data_button(heading,partial(self.match_detail,p),PAGE,INK,34,True))
-                red_selected=bool(self.selected_team and any(int(n)==int(self.selected_team) for n in mt.red))
-                blue_selected=bool(self.selected_team and any(int(n)==int(self.selected_team) for n in mt.blue))
-                red_won=winner=='RED'; blue_won=winner=='BLUE'
-                red_bg=SELECTED if red_selected else ((0.98,0.77,0.77,1) if red_won else RED_LIGHT)
-                blue_bg=SELECTED if blue_selected else ((0.75,0.85,1,1) if blue_won else BLUE_LIGHT)
-                red_prefix='🏆 ' if red_won else ''
-                blue_prefix='🏆 ' if blue_won else ''
-                row.add_widget(self.data_button(f'{red_prefix}RED   {red}     {p.red_pts:.1f} pts   •   {p.red_cow:.0%} win',partial(self.match_detail,p),red_bg,RED,40,red_selected or red_won))
-                row.add_widget(self.data_button(f'{blue_prefix}BLUE  {blue}     {p.blue_pts:.1f} pts   •   {p.blue_cow:.0%} win',partial(self.match_detail,p),blue_bg,BLUE,40,blue_selected or blue_won))
-                if red_selected or blue_selected:
-                    selected_side='RED' if red_selected else 'BLUE'
-                    row.add_widget(self.label(f'★ YOUR SELECTED TEAM IS ON THE {selected_side} ALLIANCE',10,MAROON,True,20))
+                row.add_widget(self.data_button(qual_text,partial(self.match_detail,p),PAGE,result_color,34,True))
+                red_won=mt.played and winner=='RED'; blue_won=mt.played and winner=='BLUE'
+                row.add_widget(self.data_button(f'RED  {red}',partial(self.match_detail,p),(1.00,0.88,0.88,1) if red_won else WHITE,RED,38,red_won))
+                row.add_widget(self.data_button(f'BLUE  {blue}',partial(self.match_detail,p),(0.87,0.92,1.00,1) if blue_won else WHITE,BLUE,38,blue_won))
+                row.add_widget(self.button('Open match details',partial(self.match_detail,p),38))
                 holder.add_widget(row)
         f.bind(text=render); render()
     def match_detail(self,p):
-        mt=p.match; c=Card(); self.add(c); c.add_widget(self.label(f'{mt.label} prediction',20,MAROON,True))
-        c.add_widget(self.data_button(f'RED ALLIANCE  {mt.red}   •   {p.red_pts:.1f} predicted points   •   {p.red_cow:.1%} win',bg=RED_LIGHT,fg=RED,height=48,bold=True))
-        c.add_widget(self.data_button(f'BLUE ALLIANCE {mt.blue}   •   {p.blue_pts:.1f} predicted points   •   {p.blue_cow:.1%} win',bg=BLUE_LIGHT,fg=BLUE,height=48,bold=True))
+        mt=p.match; c=Card(); self.add(c)
+        c.add_widget(self.label(f'{mt.label} match details',20,MAROON,True))
+        c.add_widget(self.label('RED ALLIANCE',13,RED,True,24))
+        for number in mt.red:
+            team=self.session.teams.get(number); name=self.session.team_names.get(number,'') or (team.name if team else '')
+            selected=int(number)==int(self.selected_team or 0)
+            c.add_widget(self.data_button(f'{number}  {name or "Team name unavailable"}  |  Select and take notes',partial(self.select_match_team,number,mt.label),SELECTED_LIGHT if selected else RED_LIGHT,RED,42,selected))
+        c.add_widget(self.label('BLUE ALLIANCE',13,BLUE,True,24))
+        for number in mt.blue:
+            team=self.session.teams.get(number); name=self.session.team_names.get(number,'') or (team.name if team else '')
+            selected=int(number)==int(self.selected_team or 0)
+            c.add_widget(self.data_button(f'{number}  {name or "Team name unavailable"}  |  Select and take notes',partial(self.select_match_team,number,mt.label),SELECTED_LIGHT if selected else BLUE_LIGHT,BLUE,42,selected))
+        c.add_widget(self.data_button(f'RED PREDICTION  {p.red_pts:.1f} points  |  {p.red_cow:.1%} win chance',bg=RED_LIGHT,fg=RED,height=42,bold=True))
+        c.add_widget(self.data_button(f'BLUE PREDICTION  {p.blue_pts:.1f} points  |  {p.blue_cow:.1%} win chance',bg=BLUE_LIGHT,fg=BLUE,height=42,bold=True))
         winner=mt.winner or p.winner
         win_bg=RED_LIGHT if winner=='RED' else BLUE_LIGHT if winner=='BLUE' else PAGE
         win_fg=RED if winner=='RED' else BLUE if winner=='BLUE' else INK
         c.add_widget(self.data_button(f'{"ACTUAL" if mt.played else "PREDICTED"} WINNER: {winner}',bg=win_bg,fg=win_fg,height=42,bold=True))
-        if mt.played:c.add_widget(self.label(f'Actual score: {mt.red_score:g} - {mt.blue_score:g}',14))
+        if mt.played: c.add_widget(self.label(f'Actual score: {mt.red_score:g} - {mt.blue_score:g}',14))
+        c.add_widget(self.label(f'Predicted red vs blue score: {p.red_pts:.1f} - {p.blue_pts:.1f}',13))
+        c.add_widget(self.label(f'Red alliance rating: {p.red_strength:.1f}  |  Blue alliance rating: {p.blue_strength:.1f}',12))
         c.add_widget(self.button('Add scouting note for this match',lambda:self.note_for_match(mt.label)))
-        c.add_widget(self.button('Back to matches',lambda:self.show_page('Matches')))
+        c.add_widget(self.button('Back to Schedule Data',lambda:self.show_page('Schedule Data')))
+    def select_match_team(self,number,match_label):
+        self.selected_team=int(number); self._pending_team=int(number); self.save_state()
+        self.note_for_match(match_label)
     def page_my_team(self):
         self.add(self.label('My team schedule',21,MAROON,True,40))
         self.add(self.label(f'Team {self.session.my_team}',14,MUTED))
@@ -412,7 +449,7 @@ class AutoScoutMobile(App):
             for k in ['cap','opr','epa','rank','auto','teleop','endgame']:c.add_widget(self.label(f'{k.upper()}: {getattr(t,k,"n/a")}',13))
         c=self.card('MATCHES')
         for m in summary['matches']:
-            c.add_widget(self.data_button(f'{m.prediction.match.label}  •  Opp {m.opponents}  •  {m.prediction.winner}  •  {m.cow:.0%}',partial(self.note_for_match,m.prediction.match.label),RED_LIGHT if m.prediction.winner=='RED' else BLUE_LIGHT if m.prediction.winner=='BLUE' else WHITE,RED if m.prediction.winner=='RED' else BLUE if m.prediction.winner=='BLUE' else INK,48,True))
+            c.add_widget(self.data_button(f'{m.prediction.match.label}  •  Opp {m.opponents}  •  {m.prediction.winner}  •  {m.cow:.0%}',partial(self.match_detail,m.prediction),RED_LIGHT if m.prediction.winner=='RED' else BLUE_LIGHT if m.prediction.winner=='BLUE' else WHITE,RED if m.prediction.winner=='RED' else BLUE if m.prediction.winner=='BLUE' else INK,48,True))
     def page_standings(self):
         self.add(self.label('Predicted standings',21,MAROON,True,40))
         c=self.card('RANK • TEAM • W-L • RP • CAP')
@@ -472,26 +509,47 @@ class AutoScoutMobile(App):
         except Exception as e:self.add(self.label('Analysis unavailable: '+str(e),12))
     def page_live_scout(self):
         self.add(self.label('Live scouting & notes',21,MAROON,True,40))
-        c=self.card('STREAM')
-        url=self.field('YouTube stream URL',self.session.live_stream_url); c.add_widget(url)
-        def open_stream():
-            self.session.live_stream_url=url.text.strip(); self.save_state();
-            if self.session.live_stream_url:webbrowser.open(self.session.live_stream_url)
-        c.add_widget(self.button('Save & open stream',open_stream))
-        n=self.card('MATCH NOTE')
-        match=self.field('Match label (e.g. Q-1)',getattr(self,'_pending_match','')); self._pending_match=''; n.add_widget(match)
-        team=self.field('Team number'); n.add_widget(team)
-        category=Spinner(text='General',values=['General','Autonomous','TeleOp','Endgame','Driver','Reliability','Strategy'],size_hint_y=None,height=dp(44)); n.add_widget(category)
-        note=self.field('Observation / scouting note',height=100,multiline=True); n.add_widget(note)
+        c=self.card('MATCH NOTE')
+        match=self.field('Match label (e.g. Q-1)',getattr(self,'_pending_match','')); self._pending_match=''; c.add_widget(match)
+        team=self.field('Team number',getattr(self,'_pending_team','')); self._pending_team=''; c.add_widget(team)
+        category=Spinner(text='General',values=['General','Autonomous','TeleOp','Endgame','Driver','Reliability','Strategy'],size_hint_y=None,height=dp(44)); c.add_widget(category)
+        note=self.field('Observation / scouting note',height=100,multiline=True); c.add_widget(note)
         def save_note():
-            key=match.text.strip() or 'General'; self.session.live_notes.setdefault(key,[]).append({'team':team.text.strip(),'category':category.text,'text':note.text.strip(),'pinned':False})
-            self.save_session(); self.say('Note saved.'); self.show_page('Live Scout')
-        n.add_widget(self.button('Save note',save_note))
+            key=match.text.strip() or 'General'
+            self.session.live_notes.setdefault(key,[]).append({'id':uuid.uuid4().hex,'team':team.text.strip(),'category':category.text,'text':note.text.strip(),'pinned':False,'created_at':__import__('datetime').datetime.now().isoformat(timespec='seconds')})
+            self.save_session(); self.save_state(); self.say('Note saved locally.')
+            if self.notes_storage=='google': self.sync_google_notes(show_status=True)
+            else: self.show_page('Live Scout')
+        c.add_widget(self.button('Save note',save_note))
+        if self.notes_storage=='google':
+            c.add_widget(self.button('Sync shared Google Sheets notes',lambda:self.sync_google_notes(show_status=True)))
         notes=self.card('SAVED NOTES')
         for key,items in self.session.live_notes.items():
-            for item in items:notes.add_widget(self.label(f'{key} • Team {item.get("team")} • {item.get("category")}: {item.get("text")}',12))
+            for item in items:
+                notes.add_widget(self.label(f'{key} • Team {item.get("team")} • {item.get("category")}: {item.get("text")}',12))
+    def sync_google_notes(self,show_status=False):
+        endpoint=(self.google_sheets_url or '').strip()
+        if not endpoint:
+            self.say('Add the Google Apps Script web app URL in Settings first.'); return
+        self.say('Syncing shared scouting notes…')
+        self._notes_syncing=True
+        def work():
+            try:
+                from google_sheets_sync import sync_notes
+                merged=sync_notes(endpoint,self.session.live_notes)
+                result=('ok',merged)
+            except Exception as exc: result=('error',str(exc))
+            def finish(_dt):
+                self._notes_syncing=False
+                if result[0]=='ok':
+                    self.session.live_notes=result[1]; self.save_session(); self.say('Shared scouting notes are up to date.')
+                else: self.say('Google Sheets sync failed: '+result[1])
+                if show_status:self.show_page('Live Scout')
+            Clock.schedule_once(finish,0)
+        threading.Thread(target=work,daemon=True).start()
     def note_for_match(self,label):
         self._pending_match=label
+        if not hasattr(self,'_pending_team'): self._pending_team=''
         self.show_page('Live Scout')
     def page_team_search(self):
         self.add(self.label('FTC team research',21,MAROON,True,40))
@@ -543,7 +601,16 @@ class AutoScoutMobile(App):
         def setbasis():self.session.settings.basis=spin.text;self.session.compute();self.save_state();self.say('Prediction basis updated.');self.show_page('Settings')
         c.add_widget(self.button('Apply rating basis',setbasis))
         c.add_widget(self.label(self.session.epa_summary(),12,MUTED))
-        c.add_widget(self.label('Session data is saved locally on this device. FTCScout requests are cached for offline/reduced-connectivity use.',12))
+        c.add_widget(self.label('Session data and notes are cached on this device. Team notes can also be shared through a Google Sheet.',12))
+        notes=self.card('SCOUTING NOTES STORAGE')
+        mode=Spinner(text='Google Sheets shared' if self.notes_storage=='google' else 'Local only',values=['Local only','Google Sheets shared'],size_hint_y=None,height=dp(44)); notes.add_widget(mode)
+        endpoint=self.field('Google Apps Script web app URL',self.google_sheets_url); notes.add_widget(endpoint)
+        def save_note_settings():
+            self.notes_storage='google' if mode.text=='Google Sheets shared' else 'local'
+            self.google_sheets_url=endpoint.text.strip(); self.save_state()
+            self.say('Notes storage settings saved.')
+            if self.notes_storage=='google' and self.google_sheets_url:self.sync_google_notes(show_status=False)
+        notes.add_widget(self.button('Save notes storage settings',save_note_settings))
         c.add_widget(self.button('Save session',self.save_session))
         c.add_widget(self.button('Export CSV',self.export_csv));c.add_widget(self.button('Export HTML',self.export_html))
 
